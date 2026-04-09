@@ -104,12 +104,12 @@ class ServerArgsModelHandlersMixin:
                     else:
                         self.enable_dp_attention = True
                         self.moe_dense_tp_size = 1
-                        assert self.dp_size == 1, (
-                            "For round-robin split mode, dp attention is not supported."
-                        )
-                    assert self.tp_size == 8, (
-                        "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
-                    )
+                        assert (
+                            self.dp_size == 1
+                        ), "For round-robin split mode, dp attention is not supported."
+                    assert (
+                        self.tp_size == 8
+                    ), "Current multi-machine CP support suffers from precision issues. So context parallel only support Single machine(tp_size == 8)"
                     self.attn_cp_size = self.tp_size // self.dp_size
 
                     logger.warning(
@@ -138,9 +138,9 @@ class ServerArgsModelHandlersMixin:
                 self._set_default_nsa_backends(self.kv_cache_dtype, major)
 
             if self.enable_nsa_prefill_context_parallel:
-                assert self.disaggregation_mode != "decode", (
-                    "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
-                )
+                assert (
+                    self.disaggregation_mode != "decode"
+                ), "CP is only supported for prefill when PD disaggregation, please remove --enable-nsa-prefill-context-parallel."
 
         else:
             # DeepSeek V3/R1/V3.1
@@ -327,9 +327,9 @@ class ServerArgsModelHandlersMixin:
                     )
 
         if self.moe_runner_backend == "triton_kernel":
-            assert self.ep_size == 1, (
-                "Triton kernel MoE is only supported when ep_size == 1"
-            )
+            assert (
+                self.ep_size == 1
+            ), "Triton kernel MoE is only supported when ep_size == 1"
 
     def _handle_mimo_family(self, hf_config, model_arch):
         if self.speculative_algorithm == "EAGLE":
@@ -378,9 +378,7 @@ class ServerArgsModelHandlersMixin:
             "ascend",
             "trtllm_mha",
             "intel_xpu",
-        }, (
-            f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
-        )
+        }, f"fa3, aiter, triton, ascend, trtllm_mha or intel_xpu is required for Llama4 model but got {self.attention_backend}"
         if is_sm100_supported() and self.moe_runner_backend == "auto":
             if self.quantization in {"fp8", "modelopt_fp8"}:
                 self.moe_runner_backend = "flashinfer_trtllm"
@@ -408,9 +406,9 @@ class ServerArgsModelHandlersMixin:
             self.disable_hybrid_swa_memory = True
             # https://docs.sglang.ai/advanced_features/attention_backend.html
             accepted_backends = ["fa3", "triton", "trtllm_mha"]
-            assert self.attention_backend in accepted_backends, (
-                f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
-            )
+            assert (
+                self.attention_backend in accepted_backends
+            ), f"One of the attention backends in {accepted_backends} is required for {model_arch}, but got {self.attention_backend}"
 
     def _handle_olmo_family(self, hf_config, model_arch):
         # FIXME: https://github.com/sgl-project/sglang/pull/7367 is not compatible with Olmo3 model.
@@ -430,9 +428,9 @@ class ServerArgsModelHandlersMixin:
         # Flashinfer appears to degrade performance when sliding window attention
         # is used for the Olmo2 architecture. Olmo2 does not use sliding window attention
         # but Olmo3 does.
-        assert self.attention_backend != "flashinfer", (
-            "FlashInfer backend can significantly degrade the performance of Olmo3 models."
-        )
+        assert (
+            self.attention_backend != "flashinfer"
+        ), "FlashInfer backend can significantly degrade the performance of Olmo3 models."
 
         logger.info(
             f"Using {self.attention_backend} as attention backend for {model_arch}."
