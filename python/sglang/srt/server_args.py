@@ -26,6 +26,8 @@ import random
 import tempfile
 from typing import Any, Callable, Dict, List, Literal, Optional, Union
 
+# Re-export choice lists and add_* helpers from arg_groups.constants.
+from sglang.srt.arg_groups.constants import *  # noqa: F403
 from sglang.srt.configs.linear_attn_model_registry import get_linear_attn_spec_by_arch
 from sglang.srt.connector import ConnectorType
 from sglang.srt.environ import envs
@@ -70,9 +72,6 @@ from sglang.srt.utils.hf_transformers_utils import check_gguf_file
 from sglang.srt.utils.network import NetworkAddress, get_free_port, wait_port_available
 from sglang.srt.utils.runai_utils import ObjectStorageModel, is_runai_obj_uri
 from sglang.utils import is_in_ci
-
-# Re-export choice lists and add_* helpers from arg_groups.constants.
-from sglang.srt.arg_groups.constants import *  # noqa: F403
 
 logger = logging.getLogger(__name__)
 
@@ -305,6 +304,8 @@ class ServerArgs:
     speculative_moe_runner_backend: Optional[str] = None
     speculative_moe_a2a_backend: Optional[str] = None
     speculative_draft_model_quantization: Optional[str] = None
+    speculative_adaptive: bool = False
+    speculative_adaptive_config: Optional[str] = None
 
     # Speculative decoding (ngram)
     speculative_ngram_min_bfs_breadth: int = 1
@@ -2576,6 +2577,11 @@ class ServerArgs:
                 not self.enable_aiter_allreduce_fusion
             ), "Aiter allreduce fusion is not supported with context parallelism"
 
+        if self.attn_cp_size != self.moe_dp_size:
+            assert (
+                self.moe_dp_size == 1
+            ), "attn_cp_size != moe_dp_size is only supported when moe_dp_size == 1"
+
     def _handle_data_parallelism(self):
         if self.dp_size == 1:
             self.enable_dp_attention = False
@@ -3245,6 +3251,22 @@ class ServerArgs:
                 raise ValueError(
                     "Currently ngram speculative decoding does not support dp attention."
                 )
+
+        if self.speculative_adaptive:
+            if self.speculative_algorithm not in ("EAGLE", "EAGLE3"):
+                logger.warning(
+                    "speculative_adaptive is only supported with EAGLE/EAGLE3 and topk=1. "
+                    f"Current algorithm={self.speculative_algorithm}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
+            elif self.speculative_eagle_topk != 1:
+                logger.warning(
+                    "speculative_adaptive is only supported with topk=1. "
+                    f"Current topk={self.speculative_eagle_topk}. "
+                    "Falling back to static params."
+                )
+                self.speculative_adaptive = False
 
     def _handle_load_format(self):
         if (
@@ -5080,6 +5102,18 @@ class ServerArgs:
             type=int,
             default=ServerArgs.speculative_ngram_external_corpus_max_tokens,
             help="Fail startup if the tokenized external ngram corpus exceeds this many tokens. Tune this based on your CPU memory budget.",
+        )
+        parser.add_argument(
+            "--speculative-adaptive",
+            action="store_true",
+            help="Enable adaptive speculative decoding that dynamically adjusts num_steps based on acceptance rate.",
+            default=ServerArgs.speculative_adaptive,
+        )
+        parser.add_argument(
+            "--speculative-adaptive-config",
+            type=str,
+            help="Path to a JSON config file for adaptive speculative decoding tuning knobs ",
+            default=ServerArgs.speculative_adaptive_config,
         )
 
         # Multi-layer Eagle speculative decoding
