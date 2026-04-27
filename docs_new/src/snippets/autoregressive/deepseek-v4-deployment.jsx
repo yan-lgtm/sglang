@@ -181,8 +181,11 @@ export const DeepSeekV4Deployment = () => {
     "h200|small|balanced",
     "h200|small|max-throughput",
     "gb300|small|low-latency",
+    "gb300|big|low-latency",
     "gb300|small|balanced",
+    "gb300|big|balanced",
     "gb300|small|max-throughput",
+    "gb300|big|max-throughput",
     "h200|small|cp",
     "h200|small|pd-disagg",
     "h200|big|low-latency",
@@ -365,6 +368,8 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --speculative-num-draft-tokens 2");
       if (hardware === "h200" && isBig) {
         flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
       } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
@@ -401,6 +406,8 @@ export const DeepSeekV4Deployment = () => {
       flags.push("  --moe-a2a-backend deepep");
       if (hardware === "h200" && isBig) {
         flags.push("  --mem-fraction-static 0.88");
+      } else if (isBig && hardware === "gb300") {
+        flags.push("  --mem-fraction-static 0.9");
       } else if (isBig && hardware === "gb200") {
         flags.push("  --mem-fraction-static 0.78");
       } else if (isBig) {
