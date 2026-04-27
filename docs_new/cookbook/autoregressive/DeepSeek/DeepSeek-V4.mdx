@@ -173,36 +173,6 @@ fail with `nvlink_transport.cpp:497 Requested address ... not found!`. If
 this happens, prepend `MC_FORCE_MNNVL=1 NCCL_MNNVL_ENABLE=1 NCCL_CUMEM_ENABLE=1`
 to both prefill and decode `sglang serve` commands.
 
-**B200 PD-Disagg cluster-specific RDMA setup**
-
-The generator emits `--disaggregation-ib-device mlx5_7` as the typical default
-for B200, but the active HCA depends on the cluster. Quickly check from each
-host (or any pod with `hostNetwork: true` and the rdma device plugin):
-
-```shell Shell
-for d in /sys/class/infiniband/mlx5_*; do
-  s=$(cat "$d/ports/1/state" 2>/dev/null | tr -d '\n')
-  echo "$(basename $d) $s"
-done
-```
-
-Pick any device showing `state=4: ACTIVE`. If cross-node KV transfer fails
-silently with `Context is not active: <hca>` or `transport retry counter
-exceeded`, also check the pkey table:
-
-```shell Shell
-for i in $(seq 0 7); do
-  v=$(cat /sys/class/infiniband/mlx5_0/ports/1/pkeys/$i 2>/dev/null)
-  [ -n "$v" ] && [ "$v" != "0x0000" ] && echo "pkey[$i]=$v"
-done
-```
-
-Mooncake hardcodes pkey index 0; if the routed partition lives at a different
-index (some clusters publish the routed partition only at index 1), either ask
-the cluster admin to put the routed pkey at index 0, or temporarily set
-`MC_FORCE_TCP=1` on both prefill and decode to fall back to TCP for KV
-transfer (functional but slower than RDMA).
-
 ## 4. Model Invocation
 
 ### 4.1 Basic Usage
