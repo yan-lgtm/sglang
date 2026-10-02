@@ -98,10 +98,15 @@ pub struct BlockRemoved {
 /// defense-in-depth — but the cost of *not* capping is unbounded memory
 /// amplification, so we cap.
 pub(crate) const MAX_HASHES_PER_EVENT: usize = 65_536;
-/// Same rationale as [`MAX_HASHES_PER_EVENT`], but for `token_ids`. A
-/// 1M-token block list is already absurdly larger than any realistic
-/// `BlockStored` payload — the cap exists to bound the worst case, not
-/// to constrain normal operation.
+/// Bounds how many `token_ids` ints one decoded event RETAINS. Unlike
+/// [`MAX_HASHES_PER_EVENT`] it is not a rejection threshold: `token_ids` is
+/// informational (routing keys off `block_hashes`), so an event past the cap
+/// keeps its first `MAX_TOKENS_PER_EVENT` ints and the rest are read and
+/// discarded. Rejecting cost far more than it protected. The cap counts
+/// FLATTENED ints, so a bigram event (two ints per token) reaches it at half
+/// the tokens, and one engine radix node is one event: a 600k-token bigram
+/// node is 1.2M ints. Every such event used to fail its whole batch, so
+/// routers never saw the longest, most reusable prefixes.
 pub(crate) const MAX_TOKENS_PER_EVENT: usize = 1_048_576;
 
 /// Errors produced by [`decode_event_batch`].
@@ -132,7 +137,7 @@ const PAYLOAD_TOO_LARGE_TAG: &str = "kv_events::wire::PAYLOAD_TOO_LARGE";
 /// payload))` — the topic and 8-byte big-endian sequence number are separate
 /// frames and are NOT part of the msgpack input here.
 ///
-/// Caps the per-event `block_hashes` and `token_ids` lengths
+/// Caps the per-event `block_hashes` length and truncates `token_ids`
 /// ([`MAX_HASHES_PER_EVENT`], [`MAX_TOKENS_PER_EVENT`]) so a misbehaving
 /// worker — or a corrupted msgpack length prefix — cannot trigger an
 /// unbounded allocation in the gateway.
@@ -272,9 +277,11 @@ impl<'de> Deserialize<'de> for TokenCell {
     }
 }
 
-/// `BoundedI64Vec`'s `u32` twin. Same shape, different cap. Accepts both flat
-/// (unigram) token ids and bigram `[t_i, t_{i+1}]` pairs via [`TokenCell`],
-/// flattening the latter.
+/// `BoundedI64Vec`'s `u32` twin, but truncating rather than rejecting — see
+/// [`MAX_TOKENS_PER_EVENT`]. Accepts both flat (unigram) token ids and bigram
+/// `[t_i, t_{i+1}]` pairs via [`TokenCell`], flattening the latter. Memory
+/// stays bounded: capacity is clamped to the cap, and ints past it are
+/// consumed from the payload without being stored.
 #[derive(Debug, Clone, PartialEq)]
 struct BoundedU32Vec(Vec<u32>);
 
@@ -293,37 +300,24 @@ impl<'de> Deserialize<'de> for BoundedU32Vec {
             where
                 A: SeqAccess<'de>,
             {
-                if let Some(hint) = seq.size_hint() {
-                    if hint > MAX_TOKENS_PER_EVENT {
-                        return Err(de::Error::custom(format!(
-                            "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{hint}:{MAX_TOKENS_PER_EVENT}"
-                        )));
-                    }
-                }
+                // The length prefix is untrusted, so it only sizes the
+                // allocation up to the cap.
                 let mut out: Vec<u32> = match seq.size_hint() {
-                    Some(h) => Vec::with_capacity(h),
+                    Some(h) => Vec::with_capacity(h.min(MAX_TOKENS_PER_EVENT)),
                     None => Vec::new(),
                 };
                 // Each element is either a scalar token id (unigram) or a
-                // `[t_i, t_{i+1}]` pair (bigram); flatten both into `out`.
+                // `[t_i, t_{i+1}]` pair (bigram); flatten both into `out`,
+                // keeping only the first MAX_TOKENS_PER_EVENT ints.
                 while let Some(cell) = seq.next_element::<TokenCell>()? {
-                    let push = |t: u32, out: &mut Vec<u32>| -> Result<(), A::Error> {
-                        if out.len() >= MAX_TOKENS_PER_EVENT {
-                            return Err(de::Error::custom(format!(
-                                "{PAYLOAD_TOO_LARGE_TAG}:token_ids:{}:{MAX_TOKENS_PER_EVENT}",
-                                out.len() + 1
-                            )));
-                        }
-                        out.push(t);
-                        Ok(())
-                    };
+                    let room = MAX_TOKENS_PER_EVENT - out.len();
                     match cell {
-                        TokenCell::One(t) => push(t, &mut out)?,
-                        TokenCell::Many(ts) => {
-                            for t in ts {
-                                push(t, &mut out)?;
+                        TokenCell::One(t) => {
+                            if room > 0 {
+                                out.push(t);
                             }
                         }
+                        TokenCell::Many(ts) => out.extend(ts.into_iter().take(room)),
                     }
                 }
                 Ok(out)
@@ -1062,37 +1056,59 @@ mod tests {
         }
     }
 
-    /// `token_ids` cap — uses an oversize msgpack array length prefix.
-    /// rmp-serde reports `size_hint` from the prefix (an `array_len` is a
-    /// known length), so the visitor refuses before reading any element.
-    /// We deliberately under-fill the array to keep the test cheap; the
-    /// decoder rejects on the prefix alone.
+    /// Regression: one engine radix node is one `BlockStored`, and on a
+    /// bigram model its `token_ids` flatten to two ints per token, so a
+    /// ~600k-token node crossed `MAX_TOKENS_PER_EVENT` and failed the WHOLE
+    /// batch ("KV event field token_ids length 1048577 exceeds cap"). Routers
+    /// then never learned the longest prefixes and routed them blind. The
+    /// event must decode with its routing fields intact, keep exactly the cap
+    /// of flattened ints, and leave its batch-mates alone.
     #[test]
-    fn block_stored_oversize_token_ids_prefix_rejected() {
-        let claimed = (MAX_TOKENS_PER_EVENT + 1) as u32;
+    fn bigram_block_stored_past_token_cap_keeps_event_and_batch() {
+        let pairs: Vec<(u32, u32)> = (0..(MAX_TOKENS_PER_EVENT / 2 + 1000) as u32)
+            .map(|i| (i, i + 1))
+            .collect();
+        let big =
+            build_block_stored_bigram_bytes(&[7_i64, 8], Some(6), &pairs, 64, None, Some("GPU"));
+        let removed = build_block_removed_bytes(&[99_i64], Some("CPU_PINNED"));
+        let bytes = build_batch_bytes(2.0, &[big, removed], Some(0), true);
 
+        let batch =
+            decode_event_batch(&bytes).expect("an over-cap bigram event must not fail its batch");
+        assert_eq!(batch.events.len(), 2);
+        match &batch.events[0] {
+            KvCacheEvent::BlockStored(b) => {
+                assert_eq!(b.block_hashes, vec![7, 8]);
+                assert_eq!(b.parent_block_hash, Some(6));
+                assert_eq!(b.block_size, 64);
+                assert_eq!(b.token_ids.len(), MAX_TOKENS_PER_EVENT);
+                assert_eq!(&b.token_ids[..4], &[0, 1, 1, 2]);
+            }
+            other => panic!("expected BlockStored, got {other:?}"),
+        }
+        match &batch.events[1] {
+            KvCacheEvent::BlockRemoved(r) => assert_eq!(r.block_hashes, vec![99]),
+            other => panic!("expected BlockRemoved, got {other:?}"),
+        }
+    }
+
+    /// An over-cap length prefix no longer short-circuits, so a prefix that
+    /// lies about a truncated payload must still fail cleanly — as a msgpack
+    /// error, not a panic, and without an allocation sized by the prefix (the
+    /// visitor clamps capacity to the cap).
+    #[test]
+    fn oversize_token_ids_prefix_over_truncated_payload_is_an_error() {
         let mut event = Vec::new();
         write_event_array(&mut event, "BlockStored", 7);
-        write_i64_array(&mut event, &[42_i64]); // block_hashes (small)
-        mp::write_nil(&mut event).unwrap(); // parent_block_hash
-                                            // Oversize token_ids: announce huge length but only write a
-                                            // single element. The visitor's size_hint check fires
-                                            // immediately and we never reach the truncated payload.
-        mp::write_array_len(&mut event, claimed).unwrap();
+        write_i64_array(&mut event, &[42_i64]);
+        mp::write_nil(&mut event).unwrap();
+        mp::write_array_len(&mut event, u32::MAX).unwrap();
         mp::write_uint(&mut event, 0).unwrap();
-        // Trailing bytes after the truncated array are ignored — the
-        // decoder errors out on the size_hint check before reading them.
-
         let bytes = build_batch_bytes(0.0, &[event], None, true);
 
-        let err = decode_event_batch(&bytes).expect_err("oversize token prefix should fail");
-        match err {
-            DecodeError::PayloadTooLarge { field, len, cap } => {
-                assert_eq!(field, "token_ids");
-                assert_eq!(cap, MAX_TOKENS_PER_EVENT);
-                assert_eq!(len, claimed as usize);
-            }
-            other => panic!("expected PayloadTooLarge, got {other:?}"),
+        match decode_event_batch(&bytes).expect_err("truncated token_ids must fail") {
+            DecodeError::Msgpack(_) => {}
+            other => panic!("expected a msgpack decode error, got {other:?}"),
         }
     }
 
